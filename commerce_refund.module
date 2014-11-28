@@ -1,0 +1,156 @@
+<?php
+
+/**
+ * @file commerce_refund.module
+ * TODO: Enter file description here.
+ */
+
+require_once __DIR__ . '/commerce_refund.message.inc';
+
+/**
+ * @TODO this is still hardcoded in rules_defaults and messages.
+ */
+define('COMMERCE_REFUND_ORDER_FIELD', 'commerce_refund_order_field');
+
+/**
+ * Implements hook_commerce_order_state_info().
+ */
+function commerce_refund_commerce_order_state_info() {
+  $order_states = array();
+
+  $order_states['refund'] = array(
+    'name' => 'refund',
+    'title' => t('Refund'),
+    'description' => t('Orders in this state are refund orders corresponding to a completed user order.'),
+    'weight' => 20,
+    'default_status' => 'pending',
+  );
+  return $order_states;
+}
+
+/**
+ * Implements hook_commerce_order_status_info().
+ */
+function commerce_refund_commerce_order_status_info() {
+  $order_statuses = array();
+
+  // Order which has been refunded (the original order)
+  $order_statuses['refund'] = array(
+    'name' => 'refund',
+    'title' => t('Refunded user order'),
+    'state' => 'completed',
+    'cart' => FALSE,
+  );
+  // Completed refund type order (the cloned order)
+  $order_statuses['refund_completed'] = array(
+    'name' => 'refund_completed',
+    'title' => t('Completed refund order'),
+    'state' => 'refund',
+    'cart' => FALSE,
+  );
+  // Pending refund type order (the cloned order)
+  $order_statuses['refund_pending'] = array(
+    'name' => 'refund_pending',
+    'title' => t('Pending refund order'),
+    'state' => 'refund',
+    'cart' => FALSE,
+  );
+  return $order_statuses;
+}
+
+/**
+ * Implements hook_flush_caches().
+ *
+ * @see commerce_message_flush_caches().
+ */
+function commerce_refund_flush_caches() {
+  module_load_install('commerce_refund');
+  commerce_refund_field_refresh();
+}
+
+/**
+ * Callback for the rules action.
+ */
+function commerce_refund_action_order_clone($order) {
+  if (!isset($order)) {
+    return;
+  }
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Create and save the reverse order to receive its id.
+  $reversed_order = commerce_order_new($order_wrapper->uid->value(), 'refund_pending');
+  commerce_order_save($reversed_order);
+  $reversed_order_wrapper = entity_metadata_wrapper('commerce_order', $reversed_order);
+
+  $reversed_order_wrapper->commerce_customer_billing = $order_wrapper->commerce_customer_billing->value();
+
+  // Iterate over each line item and invoke the line item type specific callback .
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    $line_item_type = $line_item_wrapper->type->value();
+
+    $info = commerce_refund_get_line_item_type($line_item_type);
+    if (!empty($info['callback']) && function_exists($info['callback'])) {
+      $function = $info['callback'];
+      // Delegate the line item clone logic to per-line-item-type callbacks.
+      $function($line_item_wrapper, $order, $reversed_order_wrapper);
+    }
+  }
+
+  // Save the reversed order to store the additional updates.
+  commerce_order_save($reversed_order);
+
+  // Provide the reversed order as a variable.
+  return array('reversed_order' => $reversed_order);
+}
+
+/**
+ * Get the definition of a specified line item type for order refunds.
+ */
+function commerce_refund_get_line_item_type($line_item_type, $reset = FALSE) {
+  $info = &drupal_static(__FUNCTION__);
+  if (!isset($info) || $reset) {
+    $info = module_invoke_all('commerce_refund_line_item_types_info');
+  }
+  return !empty($info[$line_item_type]) ? $info[$line_item_type] : FALSE;
+}
+
+/**
+ * Implements hook_commerce_refund_line_item_types_info().
+ */
+function commerce_refund_commerce_refund_line_item_types_info() {
+  return array(
+    // Shipping line item should simply be removed.
+    // 'shipping' => array('callback' => 'noop'),
+    'product' => array('callback' => 'commerce_refund_line_item_product'),
+  );
+}
+
+/**
+ * Callback for commerce refund line item type product.
+ * @TODO the parameters are a horror, I know, my bad.
+ */
+function commerce_refund_line_item_product($line_item_wrapper, $order, $reversed_order_wrapper) {
+  if (empty($line_item_wrapper->commerce_product)) {
+    continue;
+  }
+  $product = $line_item_wrapper->commerce_product->value();
+
+  $line_item = $line_item_wrapper->value();
+
+  // Generate a reversed line item with the data of the original line item.
+  $reversed_line_item = commerce_product_line_item_new(
+    $product,
+    $line_item->quantity,
+    $reversed_order->order_id,
+    $line_item->data,
+    $line_item->type
+  );
+  // Invoke events needed for calculating discounts/taxes. We don't want this
+  // for now.
+  // rules_invoke_event('commerce_product_calculate_sell_price',
+  // $reversed_line_item);
+
+  // Save the revesed line item and tie to order
+  commerce_line_item_save($reversed_line_item);
+  $reversed_order_wrapper->commerce_line_items[] = $reversed_line_item;
+}
